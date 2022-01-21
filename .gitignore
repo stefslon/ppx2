@@ -1,0 +1,13 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs
+/obj
+/test_out.bat
+/test.txt
+/bin/ppx2.pdb
+/ppx2.vcxproj.user
+/ppx2.vcxproj.filters
+/ppx2.vcxproj
+/ppx2.sln

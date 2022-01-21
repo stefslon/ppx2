@@ -20,6 +20,9 @@ WCHAR *pwReplaceText = NULL;
 int nParallelProcesses = 1;
 int nSplitByLine = 0;
 int nVerbose = 0;
+int nProgress = 0;
+int nJobsTodo = 0;
+int nJobsDone = 0;
 WCHAR *pwGlobalCmdLine = NULL;
 HANDLE hSemaphore = NULL;
 CRITICAL_SECTION sCriticalSection;
@@ -33,11 +36,35 @@ void *mymalloc( size_t length ) {
     return( pResult );
 }
 
+void* myrealloc(void* pResult, size_t length) {
+    void* pResult2;
+
+    EnterCriticalSection(&sCriticalSection);
+    pResult2 = realloc(pResult, length);
+    LeaveCriticalSection(&sCriticalSection);
+    return(pResult2);
+}
 
 void myfree( void *memory ) {
     EnterCriticalSection( &sCriticalSection );
     free( memory );
     LeaveCriticalSection( &sCriticalSection );
+}
+
+char* sgets(char* buf, int n, const char** str) {
+    const char* s = *str;
+    const char* lf = strchr(s, '\n');
+    int len = (lf == NULL) ? strlen(s) : (lf - s) + 1;
+
+    if (len == 0)
+        return NULL;
+    if (len > n - 1)
+        len = n - 1;
+
+    memcpy(buf, s, len);
+    buf[len] = 0;
+    *str += len;
+    return buf;
 }
 
 void print_wchar( WCHAR const *pStart, int length ) {
@@ -268,13 +295,26 @@ DWORD WINAPI ThreadProc( LPVOID lpParameter ) {
     myfree( (void *)pThreadData->pwCmdLine );
     myfree( (void *)pThreadData );
 
+    if (nProgress) {
+        nJobsDone++;
+        printf("ppx2: %d/%d\n", nJobsDone, nJobsTodo);
+    }
+
     ReleaseSemaphore( hSemaphore, 1, NULL );
     return( 0 );
 }
 
-void do_argument( char const *pArg, WCHAR const *pwLocalCmdLine ) {
+void do_argument( char const *pArg, WCHAR const *pwLocalCmdLine, int startProc ) {
     if ( nVerbose ) {
         printf( "  do_argument( \"%s\" )\n", pArg );
+    }
+
+    if (!startProc && nProgress) {
+        nJobsTodo++;
+        if (nVerbose) {
+            printf("  do_argument( stage only: \"%s\" )\n", pArg);
+        }
+        return;
     }
 
     WaitForSingleObject( hSemaphore, INFINITE );
@@ -354,7 +394,7 @@ void help( void ) {
     FILE *fout = stdout;
 
     static char acMessage[] = ""
-    "ppx2 v0.1a\n"
+    "ppx2 v0.2\n"
     "\n"
     "An xargs-like clone for Windows with multi-processing\n"
     "\n"
@@ -365,6 +405,8 @@ void help( void ) {
     "  -P <n> - maximum number of simultaneous processes, default 1\n"
     "  -I <string> - text to replace in cmd-text with argument, default {}\n"
     "  -L <max-lines> - how many lines to treat as argument\n"
+    "  -m - monitor progress\n"
+    "  -t - print debug information\n"
     "  --help - this help\n"
     "\n"
     "Notes:\n"
@@ -483,6 +525,9 @@ int main( void ) {
         } else if ( pCmdStart[index + 1] == 't' ) {
             /* verbose */
             nVerbose = 1;
+        } else if (pCmdStart[index + 1] == 'm') {
+            /* progress */
+            nProgress = 1;
         } else {
             fprintf( stderr, "Error, unsupported switch \"%c\"\n", pCmdStart[index + 1] );
             exit_with_code( 1 );
@@ -523,34 +568,50 @@ int main( void ) {
         NULL /* no name */
     );
 
-    /* process each line, and within each line */
+    /* copy all of stdin, this is not efficient, but allows determination of the number of jobs ahead of time */
+    size_t stdinBufferLen = 8196;
+    char* stdinBuffer = (char*)mymalloc(stdinBufferLen);
+    stdinBuffer[0] = '\0';
+
     char acLineBuffer[8196];
-    while ( fgets( acLineBuffer, sizeof(acLineBuffer)-1, stdin ) ) {
-        char const *pStart = acLineBuffer;
-        char const *pEnd = pStart;
+    while (fgets(acLineBuffer, sizeof(acLineBuffer) - 1, stdin)) {
+        if (strlen(stdinBuffer) + strlen(acLineBuffer) + 1 > stdinBufferLen) {
+            stdinBufferLen += 8196;
+            stdinBuffer = (char*)myrealloc(stdinBuffer, stdinBufferLen);
+        }
+        memcpy(stdinBuffer + strlen(stdinBuffer), acLineBuffer, strlen(acLineBuffer) + 1);
+    }
 
-        if ( nSplitByLine == 0 ) {
-            while ( *pEnd ) {
-                char *pArg = extract_argument( pStart );
-                pEnd = find_param_end( pStart );
-                pStart = find_param_start( pEnd );
+    /* process each line, and within each line */
+    for (int istg=1-nProgress; istg<2; istg++) {
+        char* pstdin = stdinBuffer;
+        while (sgets( acLineBuffer, sizeof(acLineBuffer)-1, &pstdin) ) {
+            char const *pStart = acLineBuffer;
+            char const *pEnd = pStart;
 
-                if ( *pArg )
-                    do_argument( pArg, pCmdStart ); /* create thread/process */
+            if ( nSplitByLine == 0 ) {
+                while ( *pEnd ) {
+                    char *pArg = extract_argument( pStart );
+                    pEnd = find_param_end( pStart );
+                    pStart = find_param_start( pEnd );
+
+                    if ( *pArg )
+                        do_argument( pArg, pCmdStart, istg ); /* create thread/process */
+
+                    myfree( (void *)pArg );
+                }
+            } else {
+                while ( *pEnd && ( *pEnd != '\n' ) && ( *pEnd != '\r' ) )
+                    pEnd++;
+
+                char *pArg = mymalloc( 1 + (pEnd - pStart) );
+                memcpy( pArg, pStart, pEnd - pStart );
+                pArg[pEnd - pStart] = '\0';
+
+                do_argument( pArg, pCmdStart, istg );
 
                 myfree( (void *)pArg );
             }
-        } else {
-            while ( *pEnd && ( *pEnd != '\n' ) && ( *pEnd != '\r' ) )
-                pEnd++;
-
-            char *pArg = mymalloc( 1 + (pEnd - pStart) );
-            memcpy( pArg, pStart, pEnd - pStart );
-            pArg[pEnd - pStart] = '\0';
-
-            do_argument( pArg, pCmdStart );
-
-            myfree( (void *)pArg );
         }
     }
 
@@ -562,6 +623,8 @@ int main( void ) {
     /* release acquired semaphores */
     for ( procs = 0; procs < nParallelProcesses; procs++ )
         ReleaseSemaphore( hSemaphore, 1, NULL );
+
+    myfree(stdinBuffer);
 
     cleanup();
     return( 0 );
